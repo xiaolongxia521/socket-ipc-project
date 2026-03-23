@@ -19,7 +19,6 @@
 #include <errno.h>
 #include <time.h>
 #include <stdarg.h>
-#include "database.h"
 
 /* ==================== 配置常量 ==================== */
 #define PORT 8080
@@ -28,7 +27,6 @@
 #define TIMEOUT_SEC 30
 #define HEARTBEAT_INTERVAL 5
 #define LOG_FILE "server.log"
-#define DB_FILE "server.db"
 
 /* ==================== 日志级别 ==================== */
 typedef enum {
@@ -215,11 +213,6 @@ void* handle_client(void* arg) {
                 LOG_INFO("[%s:%d] 收到: %s", 
                         client->client_ip, ntohs(client->addr.sin_port), buffer);
                 
-                /* 保存消息到数据库 */
-                if (database_insert(client->client_ip, ntohs(client->addr.sin_port), buffer) != 0) {
-                    LOG_ERROR("保存消息到数据库失败");
-                }
-                
                 /* 发送响应 */
                 char response[BUFFER_SIZE];
                 int len = snprintf(response, BUFFER_SIZE, "服务器收到 [%s:%d]: %s",
@@ -234,9 +227,6 @@ void* handle_client(void* arg) {
                 /* 客户端正常关闭 */
                 LOG_INFO("[%s:%d] 客户端关闭连接", 
                         client->client_ip, ntohs(client->addr.sin_port));
-                
-                /* 记录断开连接事件 */
-                database_log_connection(client->client_ip, ntohs(client->addr.sin_port), "disconnect");
                 break;
                 
             } else {
@@ -295,20 +285,6 @@ int main(void) {
     /* 初始化日志 */
     log_init();
     LOG_INFO("=== 服务器启动 ===");
-    
-    /* 初始化数据库 */
-    if (database_init(DB_FILE) != 0) {
-        LOG_ERROR("数据库初始化失败，服务器退出");
-        exit(EXIT_FAILURE);
-    }
-    LOG_INFO("数据库初始化成功: %s", DB_FILE);
-    
-    /* 初始化数据库 */
-    if (database_init(DB_FILE) != 0) {
-        LOG_ERROR("数据库初始化失败，服务器退出");
-        exit(EXIT_FAILURE);
-    }
-    LOG_INFO("数据库初始化成功: %s", DB_FILE);
     
     /* 设置信号处理 */
     signal(SIGINT, sigint_handler);
@@ -412,10 +388,7 @@ int main(void) {
     }
     
     /* 清理 */
-    LOG_INFO("服务务器关闭");
-    
-    /* 关闭数据库连接 */
-    database_close();
+    LOG_INFO("服务器关闭");
     if (server_fd >= 0) {
         close(server_fd);
     }
