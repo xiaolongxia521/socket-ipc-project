@@ -1,10 +1,7 @@
 /**
- * 改进版 TCP 多线程服务器
- * 改进点:
- * 1. 安全性: 缓冲区溢出防护、输入验证
- * 2. 健壮性: 完善的错误处理、超时控制、信号处理
- * 3. 功能性: 心跳机制、连接数限制、优雅关闭
- * 4. 代码质量: 日志系统、配置化、线程安全
+ * TCP 多线程服务器 - Step 3 (D-Bus IPC)
+ *
+ * 收到客户端消息后，调用 D-Bus 服务操作数据库
  */
 
 #include <stdio.h>
@@ -19,7 +16,7 @@
 #include <errno.h>
 #include <time.h>
 #include <stdarg.h>
-#include "database.h"
+#include "dbus-client.h"
 
 /* ==================== 配置常量 ==================== */
 #define PORT 8080
@@ -28,7 +25,7 @@
 #define TIMEOUT_SEC 30
 #define HEARTBEAT_INTERVAL 5
 #define LOG_FILE "server.log"
-#define DB_FILE "server.db"
+#define MSG_DELIM '\n'
 
 /* ==================== 日志级别 ==================== */
 typedef enum {
@@ -42,14 +39,12 @@ static const char* level_names[] = { "DEBUG", "INFO", "WARN", "ERROR" };
 static FILE *log_fp = NULL;
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/* ==================== 全局变量 ==================== */
 static int server_fd = -1;
 static volatile int running = 1;
 static int active_clients = 0;
 static pthread_mutex_t count_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t print_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/* ==================== 客户端信息结构体 ==================== */
 typedef struct {
     int socket;
     struct sockaddr_in addr;
@@ -58,7 +53,7 @@ typedef struct {
     socklen_t addr_len;
 } ClientInfo;
 
-/* ==================== 日志函数 ==================== */
+/* ==================== 日志 ==================== */
 void log_init(void) {
     log_fp = fopen(LOG_FILE, "a");
     if (!log_fp) {
@@ -72,20 +67,17 @@ void log_message(LogLevel level, const char *format, ...) {
     struct tm *tm_info = localtime(&now);
     char time_str[20];
     strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", tm_info);
-    
+
     pthread_mutex_lock(&log_mutex);
     fprintf(log_fp, "[%s] [%s] ", time_str, level_names[level]);
-    
     va_list args;
     va_start(args, format);
     vfprintf(log_fp, format, args);
     va_end(args);
-    
     fprintf(log_fp, "\n");
     fflush(log_fp);
     pthread_mutex_unlock(&log_mutex);
-    
-    /* 同时输出到控制台 */
+
     if (level >= LOG_INFO) {
         pthread_mutex_lock(&print_mutex);
         printf("[%s] [%s] ", time_str, level_names[level]);
@@ -104,324 +96,227 @@ void log_message(LogLevel level, const char *format, ...) {
 
 /* ==================== 信号处理 ==================== */
 void sigint_handler(int sig) {
-    LOG_INFO("收到信号 %d，正在优雅关闭服务器...", sig);
+    LOG_INFO("收到信号 %d，正在关闭...", sig);
     running = 0;
-    if (server_fd >= 0) {
-        close(server_fd);
-        server_fd = -1;
-    }
+    if (server_fd >= 0) close(server_fd);
+    server_fd = -1;
 }
 
-/* ==================== 安全发送/接收函数 ==================== */
+/* ==================== Socket 工具 ==================== */
 ssize_t safe_send(int sock, const void *buf, size_t len, int flags) {
-    size_t total_sent = 0;
-    while (total_sent < len) {
-        ssize_t sent = send(sock, (const char*)buf + total_sent, len - total_sent, flags);
-        if (sent < 0) {
+    size_t total = 0;
+    while (total < len) {
+        ssize_t s = send(sock, (const char*)buf + total, len - total, flags);
+        if (s < 0) { if (errno == EINTR) continue; return -1; }
+        if (s == 0) return -1;
+        total += s;
+    }
+    return (ssize_t)total;
+}
+
+int recv_line(int sock, char *buf, size_t max_len) {
+    size_t pos = 0;
+    while (pos < max_len - 1) {
+        char c;
+        ssize_t r = recv(sock, &c, 1, 0);
+        if (r == 0) return 0;
+        if (r < 0) {
             if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return pos > 0 ? (ssize_t)pos : -1;
             return -1;
         }
-        if (sent == 0) return -1;
-        total_sent += sent;
+        buf[pos++] = c;
+        if (c == MSG_DELIM) {
+            buf[pos] = '\0';
+            return (ssize_t)pos;
+        }
     }
-    return (ssize_t)total_sent;
+    buf[pos] = '\0';
+    return (ssize_t)pos;
 }
 
-ssize_t safe_recv(int sock, void *buf, size_t len, int flags) {
-    ssize_t received = recv(sock, buf, len, flags);
-    return received;
-}
-
-/* ==================== 心跳处理 ==================== */
 int send_heartbeat(int sock) {
-    const char *ping = "PING";
-    return (safe_send(sock, ping, strlen(ping), 0) > 0) ? 0 : -1;
+    const char *ping = "PING\n";
+    return safe_send(sock, ping, strlen(ping), 0) > 0 ? 0 : -1;
 }
 
 int check_heartbeat(ClientInfo *client) {
-    time_t now = time(NULL);
-    if (now - client->last_heartbeat > HEARTBEAT_INTERVAL * 2) {
-        return -1; /* 心跳超时 */
-    }
-    return 0;
+    return (time(NULL) - client->last_heartbeat > HEARTBEAT_INTERVAL * 2) ? -1 : 0;
 }
 
-/* ==================== 客户端处理线程 ==================== */
+/* ==================== 处理一行消息 ==================== */
+int handle_line(ClientInfo *client, char *line) {
+    char response[BUFFER_SIZE];
+
+    /* 去掉结尾换行 */
+    size_t len = strlen(line);
+    if (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
+        line[--len] = '\0';
+    if (len > 0 && line[len-1] == '\r')
+        line[--len] = '\0';
+    if (len == 0) return 1;
+
+    /* 心跳 - 不打印，直接跳过 */
+    if (strcmp(line, "PING") == 0) {
+        safe_send(client->socket, "PONG\n", 5, 0);
+        return 1;
+    }
+    if (strcmp(line, "PONG") == 0) return 1;
+
+
+    LOG_INFO("[%s:%d] 收到: %s", client->client_ip, ntohs(client->addr.sin_port), line);
+
+    /* 构造回复 */
+    int rlen = snprintf(response, BUFFER_SIZE, "服务器收到 [%s:%d]: %s\n",
+                       client->client_ip, ntohs(client->addr.sin_port), line);
+
+    /* 发给客户端 */
+    if (safe_send(client->socket, response, rlen, 0) < 0) {
+        LOG_ERROR("[%s:%d] 发送响应失败", client->client_ip, ntohs(client->addr.sin_port));
+        return 0;
+    }
+
+    /* 通过 D-Bus 存入数据库（核心改动） */
+    if (dbus_insert_message(client->client_ip, ntohs(client->addr.sin_port),
+                           line, response) != 0) {
+        LOG_ERROR("D-Bus InsertMessage 调用失败");
+    }
+
+    return 1;
+}
+
+/* ==================== 客户端线程 ==================== */
 void* handle_client(void* arg) {
     ClientInfo *client = (ClientInfo*)arg;
     char buffer[BUFFER_SIZE];
-    int bytes_received;
-    int should_exit = 0;
-    
-    /* 增加活跃连接数 */
+
     pthread_mutex_lock(&count_mutex);
     active_clients++;
     pthread_mutex_unlock(&count_mutex);
-    
-    LOG_INFO("[%s:%d] 新客户端连接，当前连接数: %d", 
+
+    LOG_INFO("[%s:%d] 新连接，当前: %d",
              client->client_ip, ntohs(client->addr.sin_port), active_clients);
-    
-    /* 设置接收超时 */
-    struct timeval timeout;
-    timeout.tv_sec = TIMEOUT_SEC;
-    timeout.tv_usec = 0;
-    setsockopt(client->socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    
+
+    /* 通过 D-Bus 记录连接 */
+    dbus_log_connection(client->client_ip, ntohs(client->addr.sin_port), "connect");
+
+    struct timeval tv = { .tv_sec = TIMEOUT_SEC, .tv_usec = 0 };
+    setsockopt(client->socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     client->last_heartbeat = time(NULL);
-    time_t last_heartbeat_send = 0;
-    
-    /* 主处理循环 */
+    time_t last_hb_send = 0;
+    int should_exit = 0;
+
     while (!should_exit && running) {
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(client->socket, &readfds);
-        
-        struct timeval tv;
-        tv.tv_sec = 1;  /* 1秒轮询 */
-        tv.tv_usec = 0;
-        
-        int activity = select(client->socket + 1, &readfds, NULL, NULL, &tv);
-        
-        if (activity < 0) {
-            if (errno != EINTR) {
-                LOG_ERROR("[%s:%d] select错误: %s", 
-                         client->client_ip, ntohs(client->addr.sin_port), strerror(errno));
-                break;
-            }
-            continue;
-        }
-        
-        /* 检查是否有数据可读 */
-        if (FD_ISSET(client->socket, &readfds)) {
-            bytes_received = recv(client->socket, buffer, BUFFER_SIZE - 1, 0);
-            
-            if (bytes_received > 0) {
-                buffer[bytes_received] = '\0';
+        fd_set rfds; FD_ZERO(&rfds); FD_SET(client->socket, &rfds);
+        struct timeval t = { .tv_sec = 1, .tv_usec = 0 };
+        int act = select(client->socket + 1, &rfds, NULL, NULL, &t);
+        if (act < 0) { if (errno == EINTR) continue; break; }
+
+        if (FD_ISSET(client->socket, &rfds)) {
+            int r = recv_line(client->socket, buffer, BUFFER_SIZE);
+            if (r > 0) {
                 client->last_heartbeat = time(NULL);
-                
-                /* 处理心跳包 */
-                if (strcmp(buffer, "PING") == 0) {
-                    safe_send(client->socket, "PONG", 4, 0);
-                    LOG_DEBUG("[%s:%d] 收到PING，回复PONG", 
-                             client->client_ip, ntohs(client->addr.sin_port));
-                    continue;
+                char *start = buffer;
+                char *nl;
+                while ((nl = strchr(start, MSG_DELIM)) != NULL) {
+                    *nl = '\0';
+                    if (strlen(start) > 0)
+                        if (handle_line(client, start) == 0) { should_exit = 1; break; }
+                    start = nl + 1;
                 }
-                if (strcmp(buffer, "PONG") == 0) {
-                    LOG_DEBUG("[%s:%d] 收到PONG", 
-                             client->client_ip, ntohs(client->addr.sin_port));
-                    continue;
-                }
-                
-                LOG_INFO("[%s:%d] 收到: %s", 
-                        client->client_ip, ntohs(client->addr.sin_port), buffer);
-                
-                /* 保存消息到数据库 */
-                if (database_insert(client->client_ip, ntohs(client->addr.sin_port), buffer) != 0) {
-                    LOG_ERROR("保存消息到数据库失败");
-                }
-                
-                /* 发送响应 */
-                char response[BUFFER_SIZE];
-                int len = snprintf(response, BUFFER_SIZE, "服务器收到 [%s:%d]: %s",
-                                 client->client_ip, ntohs(client->addr.sin_port), buffer);
-                if (safe_send(client->socket, response, len, 0) < 0) {
-                    LOG_ERROR("[%s:%d] 发送响应失败", 
-                             client->client_ip, ntohs(client->addr.sin_port));
-                    break;
-                }
-                
-            } else if (bytes_received == 0) {
-                /* 客户端正常关闭 */
-                LOG_INFO("[%s:%d] 客户端关闭连接", 
-                        client->client_ip, ntohs(client->addr.sin_port));
-                
-                /* 记录断开连接事件 */
-                database_log_connection(client->client_ip, ntohs(client->addr.sin_port), "disconnect");
+            } else if (r == 0) {
+                LOG_INFO("[%s:%d] 客户端关闭", client->client_ip, ntohs(client->addr.sin_port));
+                dbus_log_connection(client->client_ip, ntohs(client->addr.sin_port), "disconnect");
                 break;
-                
             } else {
-                /* 接收错误 */
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    /* 超时，检查心跳 */
-                    if (check_heartbeat(client) < 0) {
-                        LOG_WARN("[%s:%d] 心跳超时，断开连接", 
-                                client->client_ip, ntohs(client->addr.sin_port));
-                        break;
-                    }
-                    continue;
-                }
-                LOG_ERROR("[%s:%d] 接收错误: %s", 
-                         client->client_ip, ntohs(client->addr.sin_port), strerror(errno));
-                break;
+                if (errno != EAGAIN && errno != EWOULDBLOCK) { break; }
+                if (check_heartbeat(client) < 0) { LOG_WARN("心跳超时"); break; }
             }
         }
-        
-        /* 发送心跳 */
+
         time_t now = time(NULL);
-        if (now - last_heartbeat_send > HEARTBEAT_INTERVAL) {
-            if (send_heartbeat(client->socket) < 0) {
-                LOG_WARN("[%s:%d] 发送心跳失败", 
-                        client->client_ip, ntohs(client->addr.sin_port));
-                break;
-            }
-            last_heartbeat_send = now;
+        if (now - last_hb_send > HEARTBEAT_INTERVAL) {
+            if (send_heartbeat(client->socket) < 0) break;
+            last_hb_send = now;
         }
-        
-        /* 检查心跳超时 */
-        if (check_heartbeat(client) < 0) {
-            LOG_WARN("[%s:%d] 心跳超时，断开连接", 
-                    client->client_ip, ntohs(client->addr.sin_port));
-            break;
-        }
+        if (check_heartbeat(client) < 0) break;
     }
-    
-    /* 清理 */
+
     close(client->socket);
     free(client);
-    
-    pthread_mutex_lock(&count_mutex);
-    active_clients--;
-    pthread_mutex_unlock(&count_mutex);
-    
-    LOG_INFO("客户端断开，当前活跃连接数: %d", active_clients);
+    pthread_mutex_lock(&count_mutex); active_clients--; pthread_mutex_unlock(&count_mutex);
+    LOG_INFO("客户端断开，当前: %d", active_clients);
     return NULL;
 }
 
 /* ==================== 主函数 ==================== */
 int main(void) {
-    struct sockaddr_in address;
-    int addrlen = sizeof(address);
-    
-    /* 初始化日志 */
+    struct sockaddr_in addr;
+
     log_init();
-    LOG_INFO("=== 服务器启动 ===");
-    
-    /* 初始化数据库 */
-    if (database_init(DB_FILE) != 0) {
-        LOG_ERROR("数据库初始化失败，服务器退出");
+    LOG_INFO("=== TCP 服务器启动 (D-Bus IPC) ===");
+
+    /* 初始化 D-Bus 客户端 */
+    if (dbus_client_init() != 0) {
+        LOG_ERROR("D-Bus 客户端初始化失败");
         exit(EXIT_FAILURE);
     }
-    LOG_INFO("数据库初始化成功: %s", DB_FILE);
-    
-    /* 初始化数据库 */
-    if (database_init(DB_FILE) != 0) {
-        LOG_ERROR("数据库初始化失败，服务器退出");
-        exit(EXIT_FAILURE);
-    }
-    LOG_INFO("数据库初始化成功: %s", DB_FILE);
-    
-    /* 设置信号处理 */
+    LOG_INFO("D-Bus 客户端就绪");
+
     signal(SIGINT, sigint_handler);
     signal(SIGTERM, sigint_handler);
-    
-    /* 创建socket */
+
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
-        LOG_ERROR("socket创建失败: %s", strerror(errno));
-        exit(EXIT_FAILURE);
+        LOG_ERROR("socket 创建失败: %s", strerror(errno)); exit(EXIT_FAILURE);
     }
-    LOG_INFO("Socket创建成功");
-    
-    /* 设置socket选项 */
     int opt = 1;
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
-        LOG_ERROR("setsockopt失败: %s", strerror(errno));
-        exit(EXIT_FAILURE);
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(PORT);
+
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        LOG_ERROR("bind 失败: %s", strerror(errno)); exit(EXIT_FAILURE);
     }
-    LOG_INFO("Socket选项设置成功");
-    
-    /* 绑定地址和端口 */
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(PORT);
-    
-    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        LOG_ERROR("绑定失败: %s", strerror(errno));
-        exit(EXIT_FAILURE);
-    }
-    LOG_INFO("绑定成功，端口: %d", PORT);
-    
-    /* 监听连接 */
     if (listen(server_fd, SOMAXCONN) < 0) {
-        LOG_ERROR("监听失败: %s", strerror(errno));
-        exit(EXIT_FAILURE);
+        LOG_ERROR("listen 失败: %s", strerror(errno)); exit(EXIT_FAILURE);
     }
-    LOG_INFO("开始监听，最大客户端数: %d", MAX_CLIENTS);
-    LOG_INFO("服务器就绪，等待连接...");
-    
-    /* 主循环 */
+
+    LOG_INFO("监听端口 %d，最大客户端 %d", PORT, MAX_CLIENTS);
+
     while (running) {
-        /* 检查连接数限制 */
         pthread_mutex_lock(&count_mutex);
-        int current_clients = active_clients;
+        if (active_clients >= MAX_CLIENTS) {
+            pthread_mutex_unlock(&count_mutex);
+            struct sockaddr_in ca; socklen_t cl = sizeof(ca);
+            int ts = accept(server_fd, (struct sockaddr *)&ca, &cl);
+            if (ts > 0) { send(ts, "服务器繁忙\n", 9, 0); close(ts); }
+            sleep(1); continue;
+        }
         pthread_mutex_unlock(&count_mutex);
-        
-        if (current_clients >= MAX_CLIENTS) {
-            LOG_WARN("达到最大客户端数 (%d)，拒绝新连接", MAX_CLIENTS);
-            
-            /* 接受然后立即关闭，让客户端知道服务器繁忙 */
-            struct sockaddr_in client_addr;
-            socklen_t client_len = sizeof(client_addr);
-            int temp_sock = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
-            if (temp_sock > 0) {
-                char reject_msg[] = "服务器繁忙，请稍后重试\n";
-                send(temp_sock, reject_msg, strlen(reject_msg), 0);
-                close(temp_sock);
-            }
-            sleep(1);
-            continue;
+
+        ClientInfo *ci = malloc(sizeof(ClientInfo));
+        ci->addr_len = sizeof(ci->addr);
+        int ns = accept(server_fd, (struct sockaddr *)&ci->addr, &ci->addr_len);
+        if (ns < 0) { free(ci); if (errno == EINTR) continue; sleep(1); continue; }
+
+        ci->socket = ns;
+        ci->last_heartbeat = time(NULL);
+        inet_ntop(AF_INET, &ci->addr.sin_addr, ci->client_ip, INET_ADDRSTRLEN);
+
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, handle_client, ci) != 0) {
+            close(ns); free(ci); continue;
         }
-        
-        /* 接受新连接 */
-        ClientInfo *client = malloc(sizeof(ClientInfo));
-        if (!client) {
-            LOG_ERROR("内存分配失败");
-            sleep(1);
-            continue;
-        }
-        
-        client->addr_len = sizeof(client->addr);
-        int new_socket = accept(server_fd, (struct sockaddr *)&client->addr, &client->addr_len);
-        
-        if (new_socket < 0) {
-            if (errno == EINTR) {
-                free(client);
-                continue;
-            }
-            LOG_ERROR("接受连接失败: %s", strerror(errno));
-            free(client);
-            sleep(1);
-            continue;
-        }
-        
-        client->socket = new_socket;
-        client->last_heartbeat = time(NULL);
-        inet_ntop(AF_INET, &client->addr.sin_addr, client->client_ip, INET_ADDRSTRLEN);
-        
-        LOG_INFO("新连接来自: %s:%d", client->client_ip, ntohs(client->addr.sin_port));
-        
-        /* 创建线程 */
-        pthread_t thread_id;
-        if (pthread_create(&thread_id, NULL, handle_client, client) != 0) {
-            LOG_ERROR("线程创建失败: %s", strerror(errno));
-            close(client->socket);
-            free(client);
-            continue;
-        }
-        
-        pthread_detach(thread_id);
+        pthread_detach(tid);
     }
-    
-    /* 清理 */
-    LOG_INFO("服务务器关闭");
-    
-    /* 关闭数据库连接 */
-    database_close();
-    if (server_fd >= 0) {
-        close(server_fd);
-    }
-    if (log_fp && log_fp != stderr) {
-        fclose(log_fp);
-    }
-    
+
+    LOG_INFO("服务器关闭");
+    dbus_client_close();
+    if (server_fd >= 0) close(server_fd);
+    if (log_fp && log_fp != stderr) fclose(log_fp);
     return 0;
 }

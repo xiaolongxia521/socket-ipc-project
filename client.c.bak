@@ -1,8 +1,4 @@
-/**
- * TCP 客户端 - Step 2（含心跳修复）
- * 修复：按行处理消息（\n 分割），心跳不会粘合用户数据
- */
-
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,7 +10,6 @@
 #include <time.h>
 #include <signal.h>
 #include <sys/select.h>
-#include <stdarg.h>
 
 /* ==================== 配置常量 ==================== */
 #define SERVER_IP "127.0.0.1"
@@ -23,8 +18,7 @@
 #define TIMEOUT_SEC 30
 #define RECONNECT_DELAY 3
 #define MAX_RECONNECT_ATTEMPTS 5
-#define HEARTBEAT_INTERVAL 5
-#define MSG_DELIM '\n'
+#define HEARTBEAT_INTERVAL 5  /* 添加心跳间隔定义 */
 
 /* ==================== 日志函数 ==================== */
 void log_message(const char *format, ...) {
@@ -32,14 +26,14 @@ void log_message(const char *format, ...) {
     struct tm *tm_info = localtime(&now);
     char time_str[20];
     strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", tm_info);
-
+    
     printf("[%s] ", time_str);
-
+    
     va_list args;
     va_start(args, format);
     vprintf(format, args);
     va_end(args);
-
+    
     printf("\n");
 }
 
@@ -61,35 +55,14 @@ ssize_t safe_send(int sock, const void *buf, size_t len, int flags) {
     return (ssize_t)total_sent;
 }
 
-/**
- * 按行接收 socket 数据（支持粘包处理）
- */
-int recv_line(int sock, char *buf, size_t max_len) {
-    size_t pos = 0;
-    while (pos < max_len - 1) {
-        char c;
-        ssize_t r = recv(sock, &c, 1, 0);
-        if (r == 0) return 0;
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return (pos > 0) ? (ssize_t)pos : -1;
-            }
-            return -1;
-        }
-        buf[pos++] = c;
-        if (c == MSG_DELIM) {
-            buf[pos] = '\0';
-            return (ssize_t)pos;
-        }
-    }
-    buf[pos] = '\0';
-    return (ssize_t)pos;
+ssize_t safe_recv(int sock, void *buf, size_t len, int flags) {
+    ssize_t received = recv(sock, buf, len, flags);
+    return received;
 }
 
 /* ==================== 心跳处理 ==================== */
 int send_heartbeat(int sock) {
-    const char *ping = "PING\n";
+    const char *ping = "PING";
     return (safe_send(sock, ping, strlen(ping), 0) > 0) ? 0 : -1;
 }
 
@@ -97,33 +70,37 @@ int send_heartbeat(int sock) {
 int connect_to_server(const char *ip, int port) {
     int sock = 0;
     struct sockaddr_in serv_addr;
-
+    
+    /* 创建socket */
     if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         LOG_ERROR("Socket创建失败: %s", strerror(errno));
         return -1;
     }
-
+    
+    /* 设置接收超时 */
     struct timeval timeout;
     timeout.tv_sec = TIMEOUT_SEC;
     timeout.tv_usec = 0;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-
+    
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(port);
-
+    
+    /* 转换IP地址 */
     if (inet_pton(AF_INET, ip, &serv_addr.sin_addr) <= 0) {
         LOG_ERROR("无效地址/地址不支持: %s", ip);
         close(sock);
         return -1;
     }
-
+    
+    /* 连接服务器 */
     LOG_INFO("正在连接到服务器 %s:%d...", ip, port);
     if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
         LOG_ERROR("连接失败: %s", strerror(errno));
         close(sock);
         return -1;
     }
-
+    
     LOG_INFO("已成功连接到服务器！");
     return sock;
 }
@@ -135,23 +112,30 @@ int main(int argc, char *argv[]) {
     int reconnect_attempts = 0;
     int should_exit = 0;
     time_t last_heartbeat_send = 0;
-    int heartbeat_enabled = 1;
-
+    int heartbeat_enabled = 1;  /* 心跳功能开关 */
+    
+    /* 解析命令行参数 */
     const char *server_ip = SERVER_IP;
     int server_port = PORT;
-
-    if (argc > 1) server_ip = argv[1];
-    if (argc > 2) server_port = atoi(argv[2]);
-
+    
+    if (argc > 1) {
+        server_ip = argv[1];
+        if (argc > 2) {
+            server_port = atoi(argv[2]);
+        }
+    }
+    
     LOG_INFO("客户端启动，目标服务器: %s:%d", server_ip, server_port);
     LOG_INFO("使用提示:");
-    LOG_INFO("  1. 输入消息与服务器通信（回车发送）");
+    LOG_INFO("  1. 输入消息与服务器通信");
     LOG_INFO("  2. 输入 'quit' 或 'exit' 退出");
     LOG_INFO("  3. 输入 'heartbeat on/off' 开启/关闭心跳");
     LOG_INFO("  4. 输入 'ping' 发送PING测试");
     LOG_INFO("  5. 网络异常时会自动重连");
-
+    
+    /* 主循环 */
     while (!should_exit) {
+        /* 连接服务器 */
         sock = connect_to_server(server_ip, server_port);
         if (sock < 0) {
             reconnect_attempts++;
@@ -159,67 +143,75 @@ int main(int argc, char *argv[]) {
                 LOG_ERROR("重连尝试次数过多，客户端退出");
                 break;
             }
-            LOG_INFO("%d秒后尝试重连... (尝试 %d/%d)",
+            
+            LOG_INFO("%d秒后尝试重连... (尝试 %d/%d)", 
                     RECONNECT_DELAY, reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
             sleep(RECONNECT_DELAY);
             continue;
         }
-
+        
+        /* 连接成功，重置重连计数器 */
         reconnect_attempts = 0;
         last_heartbeat_send = time(NULL);
-
+        
+        /* 通信循环 */
         while (!should_exit) {
             fd_set readfds;
             FD_ZERO(&readfds);
             FD_SET(sock, &readfds);
             FD_SET(STDIN_FILENO, &readfds);
-
+            
             struct timeval tv;
-            tv.tv_sec = 1;
+            tv.tv_sec = 1;  /* 1秒轮询 */
             tv.tv_usec = 0;
-
+            
             int max_fd = (sock > STDIN_FILENO) ? sock : STDIN_FILENO;
             int activity = select(max_fd + 1, &readfds, NULL, NULL, &tv);
-
+            
             if (activity < 0) {
                 if (errno == EINTR) continue;
                 LOG_ERROR("select错误: %s", strerror(errno));
                 break;
             }
-
+            
             /* 检查服务器数据 */
             if (FD_ISSET(sock, &readfds)) {
-                int r = recv_line(sock, buffer, BUFFER_SIZE);
-
-                if (r > 0) {
-                    /* 去除结尾的 \n 和可能的 \r */
-                    size_t len = strlen(buffer);
-                    while (len > 0 && (buffer[len-1] == '\n' || buffer[len-1] == '\r')) {
-                        buffer[--len] = '\0';
-                    }
-
+                ssize_t bytes_received = recv(sock, buffer, BUFFER_SIZE - 1, 0);
+                
+                if (bytes_received > 0) {
+                    buffer[bytes_received] = '\0';
+                    
+                    /* 处理PONG响应 */
                     if (strcmp(buffer, "PONG") == 0) {
+                        LOG_INFO("收到服务器PONG响应");
                         continue;
                     }
+                    
+                    /* 处理心跳包 */
                     if (strcmp(buffer, "PING") == 0) {
-                        safe_send(sock, "PONG\n", 5, 0);
+                        safe_send(sock, "PONG", 4, 0);
+                        LOG_INFO("收到服务器PING，回复PONG");
                         continue;
                     }
-
+                    
                     LOG_INFO("服务器: %s", buffer);
-
-                } else if (r == 0) {
+                    
+                } else if (bytes_received == 0) {
+                    /* 服务器关闭连接 */
                     LOG_INFO("服务器断开连接");
                     break;
-
+                    
                 } else {
-                    if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                        LOG_ERROR("接收错误: %s", strerror(errno));
-                        break;
+                    /* 接收错误 */
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        /* 超时，继续检查 */
+                        continue;
                     }
+                    LOG_ERROR("接收错误: %s", strerror(errno));
+                    break;
                 }
             }
-
+            
             /* 检查用户输入 */
             if (FD_ISSET(STDIN_FILENO, &readfds)) {
                 printf("> ");
@@ -231,17 +223,23 @@ int main(int argc, char *argv[]) {
                     }
                     continue;
                 }
-
+                
                 /* 去除换行符 */
                 buffer[strcspn(buffer, "\n")] = 0;
-
+                
+                /* 处理退出命令 */
                 if (strcmp(buffer, "quit") == 0 || strcmp(buffer, "exit") == 0) {
                     LOG_INFO("正在断开连接...");
                     should_exit = 1;
-                    safe_send(sock, "quit\n", 5, 0);
+                    
+                    /* 通知服务器客户端要退出 */
+                    if (safe_send(sock, "quit", 4, 0) < 0) {
+                        LOG_ERROR("发送退出通知失败");
+                    }
                     break;
                 }
-
+                
+                /* 处理心跳开关 */
                 if (strncmp(buffer, "heartbeat ", 10) == 0) {
                     char *cmd = buffer + 10;
                     if (strcmp(cmd, "on") == 0) {
@@ -255,33 +253,26 @@ int main(int argc, char *argv[]) {
                     }
                     continue;
                 }
-
+                
+                /* 处理PING测试 */
                 if (strcmp(buffer, "ping") == 0) {
-                    if (safe_send(sock, "PING\n", 5, 0) < 0) {
+                    if (safe_send(sock, "PING", 4, 0) < 0) {
                         LOG_ERROR("发送PING失败");
                         break;
                     }
+                    LOG_INFO("已发送PING测试");
                     continue;
                 }
-
-                /* 发送消息（末尾加 \n） */
-                size_t len = strlen(buffer);
-                if (len > 0 && buffer[len-1] != '\n') {
-                    buffer[len] = '\0'; /* fgets 已经去掉了换行，这里确保一下 */
-                }
-
+                
+                /* 发送消息到服务器 */
                 if (safe_send(sock, buffer, strlen(buffer), 0) < 0) {
                     LOG_ERROR("发送消息失败");
                     break;
                 }
-                if (safe_send(sock, "\n", 1, 0) < 0) {
-                    LOG_ERROR("发送换行符失败");
-                    break;
-                }
-
+                
                 LOG_INFO("已发送: %s", buffer);
             }
-
+            
             /* 发送心跳 */
             if (heartbeat_enabled) {
                 time_t now = time(NULL);
@@ -291,24 +282,32 @@ int main(int argc, char *argv[]) {
                         break;
                     }
                     last_heartbeat_send = now;
+                    LOG_INFO("发送心跳PING");
                 }
             }
         }
-
+        
+        /* 关闭当前连接 */
         if (sock >= 0) {
             close(sock);
             sock = -1;
         }
-
+        
+        /* 检查是否应该退出 */
         if (should_exit) {
             LOG_INFO("客户端退出");
             break;
         }
-
+        
+        /* 重连前等待 */
         LOG_INFO("连接断开，准备重连...");
         sleep(RECONNECT_DELAY);
     }
-
-    if (sock >= 0) close(sock);
+    
+    /* 最终清理 */
+    if (sock >= 0) {
+        close(sock);
+    }
+    
     return 0;
 }
