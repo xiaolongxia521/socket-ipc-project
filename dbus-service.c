@@ -1,5 +1,5 @@
 /**
- * D-Bus 服务进程 - Step 3
+ * D-Bus 服务进程 - Step 3（稳定版）
  *
  * 总线名称: com.example.IPCDemo
  * 对象路径: /com/example/IPCDemo
@@ -8,13 +8,14 @@
  * 方法:
  *   InsertMessage(s,i,s,i) -> i
  *   SelectMessages(i)      -> a(sisis)
- *   LogConnection(s,i,s)    -> ""
+ *   LogConnection(s,i,s)  -> ""
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 #include <systemd/sd-bus.h>
 #include <systemd/sd-bus-vtable.h>
 #include <pthread.h>
@@ -27,6 +28,11 @@
 static sd_bus *bus = NULL;
 static pthread_mutex_t bus_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* 确认指针非空的辅助宏 */
+#define ENSURE_NONNULL(ptr) do { if (!(ptr) || *(ptr) == '\0') { \
+    fprintf(stderr, "[D-Bus] NULL/empty argument in %s\n", __func__); \
+    return sd_bus_error_set_errno(ret_error, EINVAL); } } while(0)
+
 /* ==================== D-Bus 方法实现 ==================== */
 
 static int method_insert_message(sd_bus_message *m, void *userdata, sd_bus_error *ret_error) {
@@ -36,17 +42,27 @@ static int method_insert_message(sd_bus_message *m, void *userdata, sd_bus_error
 
     (void)userdata;
 
+    /* 解析参数，明确检查返回值 */
     r = sd_bus_message_read(m, "sisi", &ip, &port, &msg, &resp);
     if (r < 0) {
-        fprintf(stderr, "[D-Bus] InsertMessage: 读取参数失败: %s\n", strerror(-r));
+        fprintf(stderr, "[D-Bus] InsertMessage: sd_bus_message_read 失败: %s\n", strerror(-r));
         return r;
     }
 
+    /* 防御性检查：确认所有指针有效 */
+    if (!ip || !msg) {
+        fprintf(stderr, "[D-Bus] InsertMessage: NULL parameter ip=%p msg=%p\n", ip, msg);
+        sd_bus_error_set_errno(ret_error, EINVAL);
+        return -EINVAL;
+    }
+    if (!resp) resp = "";
+
     pthread_mutex_lock(&bus_mutex);
-    int ret = database_insert(ip, port, msg, resp ? resp : "");
+    r = database_insert(ip, port, msg, resp);
     pthread_mutex_unlock(&bus_mutex);
 
-    if (ret < 0) {
+    if (r < 0) {
+        fprintf(stderr, "[D-Bus] InsertMessage: database_insert 失败\n");
         sd_bus_error_set_errno(ret_error, EIO);
         return -EIO;
     }
@@ -61,23 +77,35 @@ static int method_select_messages(sd_bus_message *m, void *userdata, sd_bus_erro
     (void)userdata;
 
     r = sd_bus_message_read(m, "i", &limit);
-    if (r < 0) return r;
+    if (r < 0) {
+        fprintf(stderr, "[D-Bus] SelectMessages: 读取参数失败: %s\n", strerror(-r));
+        return r;
+    }
+    if (limit <= 0) limit = 10;
 
     sd_bus_message *reply = NULL;
     r = sd_bus_message_new_method_return(m, &reply);
-    if (r < 0) return r;
+    if (r < 0) {
+        fprintf(stderr, "[D-Bus] SelectMessages: 创建回复消息失败: %s\n", strerror(-r));
+        return r;
+    }
 
-    /* 打开数组容器 */
     r = sd_bus_message_open_container(reply, 'a', "(sisis)");
-    if (r < 0) { sd_bus_message_unref(reply); return r; }
+    if (r < 0) {
+        fprintf(stderr, "[D-Bus] SelectMessages: 打开容器失败: %s\n", strerror(-r));
+        sd_bus_message_unref(reply);
+        return r;
+    }
 
-    pthread_mutex_lock(&bus_mutex);
-
-    /* 遍历数据库行，写入回复 */
+    /* 直接在 dbus-service 进程内查询数据库（避免跨进程共享句柄） */
     sqlite3 *db_local = NULL;
     sqlite3_stmt *stmt = NULL;
 
-    if (sqlite3_open("server.db", &db_local) != SQLITE_OK) {
+    pthread_mutex_lock(&bus_mutex);
+    r = sqlite3_open("server.db", &db_local);
+    if (r != SQLITE_OK) {
+        fprintf(stderr, "[D-Bus] SelectMessages: 无法打开数据库: %s\n", sqlite3_errmsg(db_local));
+        if (db_local) sqlite3_close(db_local);
         pthread_mutex_unlock(&bus_mutex);
         sd_bus_message_unref(reply);
         return -EIO;
@@ -85,32 +113,43 @@ static int method_select_messages(sd_bus_message *m, void *userdata, sd_bus_erro
 
     const char *sql = "SELECT id, client_ip, client_port, client_msg, server_response, timestamp "
                      "FROM messages ORDER BY timestamp DESC LIMIT ?;";
-    if (sqlite3_prepare_v2(db_local, sql, -1, &stmt, NULL) == SQLITE_OK) {
-        sqlite3_bind_int(stmt, 1, limit);
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
-            const char *col_ip   = (const char*)sqlite3_column_text(stmt, 1);
-            int         col_port = sqlite3_column_int(stmt, 2);
-            const char *col_msg  = (const char*)sqlite3_column_text(stmt, 3);
-            const char *col_resp = (const char*)sqlite3_column_text(stmt, 4);
-            const char *col_time = (const char*)sqlite3_column_text(stmt, 5);
-
-            r = sd_bus_message_append(reply, "(sisis)",
-                                      col_ip   ? col_ip   : "",
-                                      col_port,
-                                      col_msg  ? col_msg  : "",
-                                      col_resp ? col_resp : "",
-                                      col_time ? col_time : "");
-            if (r < 0) break;
-        }
-        sqlite3_finalize(stmt);
+    r = sqlite3_prepare_v2(db_local, sql, -1, &stmt, NULL);
+    if (r != SQLITE_OK) {
+        fprintf(stderr, "[D-Bus] SelectMessages: SQL 准备失败: %s\n", sqlite3_errmsg(db_local));
+        sqlite3_close(db_local);
+        pthread_mutex_unlock(&bus_mutex);
+        sd_bus_message_unref(reply);
+        return -EIO;
     }
+
+    sqlite3_bind_int(stmt, 1, limit);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *col_ip   = (const char*)sqlite3_column_text(stmt, 1);
+        const char *col_msg  = (const char*)sqlite3_column_text(stmt, 3);
+        const char *col_resp = (const char*)sqlite3_column_text(stmt, 4);
+        const char *col_time = (const char*)sqlite3_column_text(stmt, 5);
+
+        r = sd_bus_message_append(reply, "(sisis)",
+                                  col_ip   ? col_ip   : "",
+                                  sqlite3_column_int(stmt, 2),
+                                  col_msg  ? col_msg  : "",
+                                  col_resp ? col_resp : "",
+                                  col_time ? col_time : "");
+        if (r < 0) {
+            fprintf(stderr, "[D-Bus] SelectMessages: 追加行失败\n");
+            break;
+        }
+    }
+
+    sqlite3_finalize(stmt);
     sqlite3_close(db_local);
     pthread_mutex_unlock(&bus_mutex);
 
     sd_bus_message_close_container(reply);
+
     r = sd_bus_send(bus, reply, NULL);
     sd_bus_message_unref(reply);
-    if (r >= 0) sd_bus_process(bus, NULL);
     return r < 0 ? r : 0;
 }
 
@@ -122,13 +161,21 @@ static int method_log_connection(sd_bus_message *m, void *userdata, sd_bus_error
     (void)userdata;
 
     r = sd_bus_message_read(m, "sis", &ip, &port, &event);
-    if (r < 0) return r;
+    if (r < 0) {
+        fprintf(stderr, "[D-Bus] LogConnection: 读取参数失败: %s\n", strerror(-r));
+        return r;
+    }
+
+    if (!ip || !event) {
+        sd_bus_error_set_errno(ret_error, EINVAL);
+        return -EINVAL;
+    }
 
     pthread_mutex_lock(&bus_mutex);
-    int ret = database_log_connection(ip, port, event);
+    r = database_log_connection(ip, port, event);
     pthread_mutex_unlock(&bus_mutex);
 
-    if (ret < 0) {
+    if (r < 0) {
         sd_bus_error_set_errno(ret_error, EIO);
         return -EIO;
     }
@@ -140,9 +187,9 @@ static int method_log_connection(sd_bus_message *m, void *userdata, sd_bus_error
 
 static const sd_bus_vtable service_vtable[] = {
     SD_BUS_VTABLE_START(0),
-    SD_BUS_METHOD("InsertMessage",  "sisi", "i", method_insert_message,  SD_BUS_VTABLE_UNPRIVILEGED),
+    SD_BUS_METHOD("InsertMessage",  "sisi", "i",        method_insert_message,  SD_BUS_VTABLE_UNPRIVILEGED),
     SD_BUS_METHOD("SelectMessages", "i",    "a(sisis)", method_select_messages, SD_BUS_VTABLE_UNPRIVILEGED),
-    SD_BUS_METHOD("LogConnection",  "sis",  "",         method_log_connection,  SD_BUS_VTABLE_UNPRIVILEGED),
+    SD_BUS_METHOD("LogConnection",  "sis",  "",          method_log_connection,  SD_BUS_VTABLE_UNPRIVILEGED),
     SD_BUS_VTABLE_END
 };
 
