@@ -111,11 +111,11 @@ int database_insert(const char *client_ip, int port,
         return -1;
     }
 
-    /* 绑定参数 */
-    sqlite3_bind_text(stmt, 1, client_ip, -1, SQLITE_STATIC);
+    /* 绑定参数（用 SQLITE_TRANSIENT 因为指针来自外部/D-Bus 内存） */
+    sqlite3_bind_text(stmt, 1, client_ip, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 2, port);
-    sqlite3_bind_text(stmt, 3, client_msg, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 4, server_response ? server_response : "", -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 3, client_msg, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, server_response ? server_response : "", -1, SQLITE_TRANSIENT);
 
     /* 执行 */
     rc = sqlite3_step(stmt);
@@ -206,9 +206,9 @@ int database_log_connection(const char *ip, int port, const char *event) {
         return -1;
     }
 
-    sqlite3_bind_text(stmt, 1, ip, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 1, ip, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 2, port);
-    sqlite3_bind_text(stmt, 3, event, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 3, event, -1, SQLITE_TRANSIENT);
 
     rc = sqlite3_step(stmt);
     if (rc != SQLITE_DONE) {
